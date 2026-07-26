@@ -15,6 +15,62 @@ import msds_parser as mp
 import xlsx_writers as xw
 import kreach_lookup as kr
 
+
+def dedup_ho6_by_cas(rows):
+    """6호서식 행을 CAS번호 기준으로 병합한다.
+    - 같은 CAS가 여러 MSDS에서 추출되어도 6호서식에는 1행만 남긴다.
+    - 함량(%)은 관측된 최소~최대 범위로 병합한다.
+    - 비고에는 근거가 된 모든 제품명을 나열하고, 위험노출수준이 기술지침 표(1차 공식 출처)가
+      아닌 보충조사/미확정 값인 경우 그 출처를 함께 기입한다.
+    - CAS가 없는 행(추출 실패 등)은 병합하지 않고 그대로 각각 유지한다.
+    """
+    groups = {}
+    order = []
+    for r in rows:
+        cas = (r.get("CAS번호") or "").strip()
+        key = cas if cas else f"__nocasid_{id(r)}"
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(r)
+
+    merged = []
+    for key in order:
+        group = groups[key]
+        base = dict(group[0])
+        product_names = [g.get("product_name", "") for g in group if g.get("product_name")]
+        product_names = list(dict.fromkeys(product_names))  # 순서 보존 중복제거
+
+        if len(group) > 1:
+            pct_nums = []
+            for g in group:
+                txt = str(g.get("함량(%)", "") or "")
+                pct_nums += [float(n) for n in re.findall(r"\d+(?:\.\d+)?", txt)]
+            if pct_nums:
+                lo, hi = min(pct_nums), max(pct_nums)
+                base["함량(%)"] = f"{lo:g}%" if lo == hi else f"{lo:g}~{hi:g}%"
+
+            sg_vals = {g.get("비중") for g in group
+                       if isinstance(g.get("비중"), (int, float)) and str(g.get("비중")) != "nan"}
+            source_files = list(dict.fromkeys(g.get("source_file", "") for g in group if g.get("source_file")))
+            base["source_file"] = ", ".join(source_files)
+            base["needs_review"] = bool(base.get("needs_review")) or any(g.get("needs_review") for g in group) \
+                or len(sg_vals) > 1
+
+        remark_parts = [", ".join(product_names)] if product_names else []
+        ep_status = base.get("위험노출수준_상태", "")
+        ep_source = base.get("위험노출수준_출처", "")
+        if ep_status in ("supplementary", "na", "no_data", "msds_text") and ep_source:
+            remark_parts.append(f"[위험노출수준 출처: {ep_source}]")
+        base["비고"] = " / ".join(remark_parts)
+
+        merged.append(base)
+
+    for i, r in enumerate(merged, start=1):
+        r["연번"] = i
+    return merged
+
+
 st.set_page_config(page_title="6호서식 작성 툴", layout="wide")
 st.title("🧪 유해화학물질 목록(별지 제6호서식) 자동 작성 툴")
 st.markdown("##### MSDS(PDF) 업로드 → 물성값 자동추출 + K-REACH 규제정보 자동조회")
@@ -79,6 +135,15 @@ if uploaded_files:
                     parts.append(f"사고대비 {kres['accident_prep_no']}")
                 row["고유번호"] = "\n".join(parts)
 
+                # 물질명 최종 확정: K-REACH 국문명(name_kr)이 있으면 최우선 사용,
+                # 없으면 msds_parser가 CAS 기준으로 해석해 둔 값을 그대로 유지한다.
+                # (제품명은 어떤 단계에서도 물질명으로 사용하지 않는다.)
+                if kres.get("name_kr"):
+                    row["물질명"] = kres["name_kr"]
+                if not row.get("물질명"):
+                    row["물질명"] = f"[물질명 미확인] CAS {cas}" if cas else "[물질명 미확인]"
+                    row["needs_review"] = True
+
                 row["비고"] = row.get("product_name", "")
 
                 is_regulated = bool(
@@ -116,8 +181,9 @@ if uploaded_files:
 
         display_cols = [
             "연번", "6호서식대상", "source_file", "product_name", "물질명", "CAS번호", "고유번호",
-            "물질상태", "함량(%)", "비중", "폭발하한", "폭발상한", "위험노출수준", "허용농도값",
-            "증기압(mmHg)", "부식성", "독성구분_항목", "독성구분_등급", "kreach_status", "kreach_note",
+            "물질상태", "함량(%)", "비중", "폭발하한", "폭발상한", "위험노출수준", "위험노출수준_출처",
+            "허용농도값", "증기압(mmHg)", "부식성", "독성구분_항목", "독성구분_등급",
+            "kreach_status", "kreach_note",
         ]
         show_df = df[display_cols].rename(columns={"source_file": "출처파일", "product_name": "제품명"})
 
@@ -130,7 +196,7 @@ if uploaded_files:
                 "폭발상한": st.column_config.NumberColumn(format="%.2f"),
                 "증기압(mmHg)": st.column_config.NumberColumn(format="%.2f"),
             },
-            disabled=["연번", "출처파일", "kreach_status", "kreach_note"],
+            disabled=["연번", "출처파일", "위험노출수준_출처", "kreach_status", "kreach_note"],
             hide_index=True,
             use_container_width=True,
         )
@@ -151,7 +217,13 @@ if uploaded_files:
 
         col_dl1, col_dl2 = st.columns(2)
         with col_dl1:
-            ho6_rows = [r for r in merged_rows if r.get("6호서식대상")]
+            ho6_rows_raw = [r for r in merged_rows if r.get("6호서식대상")]
+            ho6_rows = dedup_ho6_by_cas(ho6_rows_raw)
+            if len(ho6_rows) < len(ho6_rows_raw):
+                st.caption(
+                    f"※ 동일 CAS번호 {len(ho6_rows_raw)}건 → {len(ho6_rows)}건으로 병합했습니다 "
+                    "(같은 물질이 여러 MSDS에서 확인된 경우 1행으로 통합)."
+                )
             ho6_bytes = xw.build_6ho_form(ho6_rows)
             st.download_button(
                 label=f"[별지6호서식] 유해화학물질목록 다운로드 ({len(ho6_rows)}건)",
