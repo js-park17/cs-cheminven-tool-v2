@@ -13,6 +13,11 @@ try:
 except ImportError:
     pdfplumber = None
 
+try:
+    import endpoint_concentration as ec
+except ImportError:
+    ec = None
+
 CAS_RE = re.compile(r'\b(\d{2,7}-\d{2}-\d)\b')
 WATER_CAS = "7732-18-5"
 
@@ -53,10 +58,23 @@ CAS_KOREAN_NAME = {
     "7664-39-3": "불산(플루오르화수소)", "1336-21-6": "암모니아수",
     "7727-37-9": "질소", "7732-18-5": "물", "78-93-3": "메틸에틸케톤(MEK)",
     "7553-56-2": "요오드", "12027-06-4": "암모늄요오드화합물", "7664-41-7": "암모니아",
+    "141-78-6": "에틸아세테이트(초산에틸)", "7664-38-2": "인산",
+    "7697-37-2": "질산", "7782-50-5": "염소", "7783-06-4": "황화수소",
 }
 
-def guess_korean_name(cas, fallback_name=""):
-    return CAS_KOREAN_NAME.get(cas, fallback_name)
+def _clean_name_en(name_en):
+    """영문명을 CAS 사전에 없을 때의 최종 보조 표기로 정리(제품명 아님을 보장)."""
+    if not name_en:
+        return ""
+    return name_en.strip()
+
+def guess_korean_name(cas, name_en=""):
+    """CAS번호 기준으로만 물질명을 해석한다. 절대 제품명(product_name)으로 대체하지 않는다.
+    우선순위: CAS 국문 사전 -> (사전에 없으면) 정제된 영문명 -> 빈 문자열(검토 필요).
+    최종 확정은 app.py 단계에서 K-REACH 조회 결과(name_kr)로 재확인/치환된다."""
+    if cas in CAS_KOREAN_NAME:
+        return CAS_KOREAN_NAME[cas]
+    return _clean_name_en(name_en)
 
 # ---------------------------------------------------------------------------
 # 섹션 분리
@@ -433,14 +451,15 @@ def parse_endpoint_concentration(full_text):
 # 허용농도값: 11.독성에 관한 정보 - TWA > LD50 > LC50 우선순위
 # ---------------------------------------------------------------------------
 TWA_RE = re.compile(r'TWA\s*[:：]?\s*([\d,]+(?:\.\d+)?)\s*(ppm|mg/m3|mg/㎥|㎎/㎥)', re.IGNORECASE)
+_TOX_NUM = r'[\d,]+(?:\.\d+)?(?:\s*[\-~]\s*[\d,]+(?:\.\d+)?)?'  # 단일값 또는 "117-125" 범위값 모두 지원
 LD50_INLINE_RE = re.compile(
-    r'\bLD\s*50\s*([\d,]+(?:\.\d+)?)\s*(㎎/㎏|mg/kg|mg/㎏|㎍/㎏)\s*(?:\(([^)]+)\)|,?\s*([A-Za-z가-힣]+))?')
+    r'\bLD\s*50\s*(' + _TOX_NUM + r')\s*(㎎/㎏|mg/kg|mg/㎏|㎍/㎏)\s*(?:\(([^)]+)\)|,?\s*([A-Za-z가-힣]+))?')
 LD50_BROKEN_RE = re.compile(
-    r'\bLD\s+([\d,]+(?:\.\d+)?)\s*(㎎/㎏|mg/kg|mg/㎏)([^\n]{0,40})\n\s*(?:mix\s*)?50\b')
+    r'\bLD\s+(' + _TOX_NUM + r')\s*(㎎/㎏|mg/kg|mg/㎏)([^\n]{0,90})\n\s*(?:mix\s*)?50\b')
 LC50_INLINE_RE = re.compile(
-    r'\bLC\s*50\s*([\d,]+(?:\.\d+)?)\s*(ppm|㎎/[㎥ℓLl]|mg/m3|mg/L)\s*(?:\(([^)]+)\)|,?\s*([A-Za-z가-힣]+))?')
+    r'\bLC\s*50\s*(' + _TOX_NUM + r')\s*(ppm|㎎/[㎥ℓLl]|mg/m3|mg/L)\s*(?:\(([^)]+)\)|,?\s*([A-Za-z가-힣]+))?')
 LC50_BROKEN_RE = re.compile(
-    r'\bLC\s+([\d,]+(?:\.\d+)?)\s*(ppm|㎎/[㎥ℓLl]|mg/m3|mg/L)([^\n]{0,40})\n\s*(?:mix\s*)?50\b')
+    r'\bLC\s+(' + _TOX_NUM + r')\s*(ppm|㎎/[㎥ℓLl]|mg/m3|mg/L)([^\n]{0,90})\n\s*(?:mix\s*)?50\b')
 
 def parse_toxicity_reference_value(section11_text):
     """TWA > LD50 > LC50 순으로 11.독성에 관한 정보에서 값 채택"""
@@ -504,7 +523,6 @@ def parse_msds(file_bytes, filename=""):
     composition = parse_composition(sec3)
     physchem = parse_physchem(sec9)
     hazards = parse_hazard_classification(sec2)
-    endpoint_conc = parse_endpoint_concentration(full_text)
     toxicity_ref = parse_toxicity_reference_value(sec11)
     corrosive = infer_corrosive(hazards, physchem)
 
@@ -523,8 +541,35 @@ def parse_msds(file_bytes, filename=""):
 
     rows = []
     for comp in components:
-        kr_name = guess_korean_name(comp["cas"], comp["name_en"] or product_name)
-        name_needs_review = kr_name == comp["name_en"] and comp["name_en"] != ""
+        kr_name = guess_korean_name(comp["cas"], comp["name_en"])
+        # 물질명이 CAS 사전에 없어 영문명(또는 빈값)으로 남은 경우 검토 필요 표시.
+        # product_name(제품명)은 절대 물질명으로 사용하지 않는다 - app.py에서 K-REACH name_kr로 최종 확정.
+        name_needs_review = (not kr_name) or (kr_name == comp["name_en"] and comp["name_en"] != "")
+
+        ep_value, ep_source, ep_status = (None, None, "not_found")
+        if ec is not None:
+            ep_value, ep_source, ep_status = ec.lookup_endpoint(comp["cas"])
+        endpoint_conc = ep_value or ""
+        endpoint_needs_review = False
+        if not endpoint_conc:
+            # 1차: 기술지침 표 + 보충조사 테이블에 없음 -> 2차: MSDS 원문 내 ERPG/AEGL/PAC/IDLH 직접 기재 검색
+            text_val = parse_endpoint_concentration(full_text)
+            if text_val:
+                endpoint_conc = text_val
+                ep_source = "MSDS 원문에 기재된 응급노출기준값"
+                ep_status = "msds_text"
+            elif toxicity_ref:
+                # 3차: 끝점농도 자료 전무 -> MSDS 독성값(LD50/LC50/TWA)을 참고값으로 표기, 수동 환산 필요
+                endpoint_conc = f"[미확정] 참고: {toxicity_ref}"
+                ep_source = ("ERPG-2/AEGL-2/PAC-2/IDLH 자료 없음 - MSDS 독성정보(LD50/LC50)를 참고값으로 표기함. "
+                              "「사고시나리오 선정 및 위험도 분석에 관한 기술지침」 <붙임2> 산식으로 IDLH 환산 후 확정 필요")
+                ep_status = "no_data"
+                endpoint_needs_review = True
+            else:
+                ep_source = "ERPG-2/AEGL-2/PAC-2/IDLH 및 MSDS 독성정보(LD50/LC50) 모두 확인 불가 - 전문가 확인 필요"
+                ep_status = "no_data"
+                endpoint_needs_review = True
+
         rows.append({
             "source_file": filename,
             "product_name": product_name,
@@ -544,6 +589,8 @@ def parse_msds(file_bytes, filename=""):
             "독성구분_항목": "\n".join([h[0] + (f"({h[1]})" if h[1] else "") for h in hazards]),
             "독성구분_등급": "\n".join([h[2] for h in hazards]),
             "위험노출수준": endpoint_conc,
+            "위험노출수준_출처": ep_source or "",
+            "위험노출수준_상태": ep_status,
             "허용농도값": toxicity_ref,
             "msds_reg_no": meta["msds_reg_no"],
             "revision_no": meta["revision_no"],
@@ -551,13 +598,15 @@ def parse_msds(file_bytes, filename=""):
             "enact_date": enact_date,
             "usage": usage,
             "다성분혼합물": is_mixture,
-            "needs_review": name_needs_review or physchem["specific_gravity"] is None or is_mixture,
+            "needs_review": name_needs_review or physchem["specific_gravity"] is None or is_mixture or endpoint_needs_review,
         })
 
     if not rows:
         rows.append({
             "source_file": filename, "product_name": product_name,
-            "물질명": product_name, "CAS번호": "", "함량(%)": "",
+            # CAS를 확인할 수 없는 극히 예외적인 실패 케이스에 한해 제품명을 임시 표기(반드시 수동 검토 필요).
+            "물질명": f"[CAS 미확인] {product_name}",
+            "CAS번호": "", "함량(%)": "",
             "물질상태": physchem["state"], "비중": physchem["specific_gravity"],
             "인화점(℃)": physchem["flash_point_c"], "폭발하한": physchem["explosion_lower"],
             "폭발상한": physchem["explosion_upper"], "증기압(mmHg)": physchem["vapor_pressure_mmhg"],
@@ -565,7 +614,9 @@ def parse_msds(file_bytes, filename=""):
             "규제구분요약": "성분 추출 실패 - 수동 입력 필요",
             "독성구분_항목": "\n".join([h[0] for h in hazards]),
             "독성구분_등급": "\n".join([h[2] for h in hazards]),
-            "위험노출수준": endpoint_conc,
+            "위험노출수준": "",
+            "위험노출수준_출처": "CAS 미확인으로 조회 불가",
+            "위험노출수준_상태": "no_cas",
             "허용농도값": toxicity_ref,
             "msds_reg_no": meta["msds_reg_no"],
             "revision_no": meta["revision_no"],
